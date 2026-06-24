@@ -323,7 +323,6 @@ function appendMsg(text, type) {
   $messages.scrollTop = $messages.scrollHeight;
 }
 
-// WEBRTC
 function createPC() {
   const pc = new RTCPeerConnection(ICE_CONFIG);
   pc.onicecandidate = ({ candidate }) => {
