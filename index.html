@@ -102,6 +102,7 @@ html,body{height:100%;font-family:'Inter',system-ui,sans-serif;font-size:14px;ba
 .header-call-btn{width:38px;height:38px;border-radius:50%;background:transparent;border:1px solid var(--border);cursor:pointer;display:flex;align-items:center;justify-content:center;color:var(--call);transition:all 0.2s;flex-shrink:0}
 .header-call-btn:hover{background:rgba(34,211,238,0.12);border-color:var(--call);transform:scale(1.08)}
 .header-call-btn:active{transform:scale(0.95)}
+.header-call-btn:disabled{opacity:0.35;cursor:not-allowed}
 
 /* ── TYPING INDICATOR ── */
 #typing-indicator{display:none;align-items:center;gap:8px;padding:4px 16px 4px;color:var(--text-sec);font-size:11px;height:24px}
@@ -367,7 +368,7 @@ html,body{height:100%;font-family:'Inter',system-ui,sans-serif;font-size:14px;ba
     <audio id="remote-audio" autoplay playsinline></audio>
     <div id="typing-indicator"><div class="typing-dots"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div><span>печатает...</span></div>
     <div id="messages"></div>
-    <div id="emoji-input-panel" id="emoji-input-panel"></div>
+    <div id="emoji-input-panel"></div>
     <div id="img-preview">
       <img id="img-preview-thumb" src="" alt=""/>
       <span id="img-preview-name"></span>
@@ -441,10 +442,19 @@ let socket,peerConnection,dataChannel,peerId;
 let pendingImg=null,typingTimer=null,isTyping=false;
 const reactions={};
 
+// call state
+let callPC=null;               // RTCPeerConnection dedicated to voice (separate from chat's dataChannel PC)
+let localCallStream=null;      // local mic MediaStream
+let callMode=null;             // 'inchat' | 'standalone-caller' | 'standalone-guest'
+let pendingCallOffer=null;     // SDP offer waiting for accept/decline (in-chat incoming)
+let pendingCallIce=[];         // ICE candidates queued until remote description is set
+let callTimerInterval=null,callStartTs=null,callMuted=false;
+
 const $=id=>document.getElementById(id);
 const $app=$('app'),$serverDot=$('server-dot'),$serverText=$('server-text');
 const $alertBox=$('alert-box'),$lobbyContent=$('lobby-content');
 const $waitingArea=$('waiting-area'),$codeDisplay=$('code-display');
+const $waitingLabel=$('waiting-label'),$waitingHintText=$('waiting-hint-text');
 const $emptyState=$('empty-state'),$connectingOv=$('connecting-overlay');
 const $connectingText=$('connecting-text'),$chatHeader=$('chat-header');
 const $messages=$('messages'),$inputArea=$('input-area');
@@ -452,8 +462,15 @@ const $msgInput=$('msg-input'),$sendBtn=$('send-btn');
 const $typingIndicator=$('typing-indicator');
 const $emojiPanel=$('emoji-input-panel'),$imgPreview=$('img-preview');
 
+const $btnCreateCall=$('btn-create-call'),$joinCallInput=$('join-call-input'),$btnJoinCall=$('btn-join-call');
+const $headerCallBtn=$('header-call-btn');
+const $callOverlay=$('call-overlay'),$callTimerEl=$('call-timer'),$callStatusText=$('call-status-text');
+const $callMuteBtn=$('call-mute-btn'),$callHangupBtn=$('call-hangup-btn');
+const $incomingBanner=$('incoming-call-banner'),$incomingAcceptBtn=$('incoming-accept-btn'),$incomingDeclineBtn=$('incoming-decline-btn');
+const $remoteAudio=$('remote-audio');
+
 // build emoji panel
-EMOJIS.forEach(e=>{const b=document.createElement('button');b.textContent=e;b.onclick=()=>{$msgInput.value+=$msgInput.value.slice(-1)==='' ? e : e;$msgInput.focus();$emojiPanel.classList.remove('show')};$emojiPanel.appendChild(b)});
+EMOJIS.forEach(e=>{const b=document.createElement('button');b.textContent=e;b.onclick=()=>{$msgInput.value+=e;$msgInput.focus();$emojiPanel.classList.remove('show')};$emojiPanel.appendChild(b)});
 
 const showAlert=m=>{$alertBox.textContent=m;$alertBox.classList.add('show')};
 const hideAlert=()=>$alertBox.classList.remove('show');
@@ -464,12 +481,15 @@ const fmt=d=>d.toLocaleTimeString('ru',{hour:'2-digit',minute:'2-digit'});
 function showLobby(){
   $lobbyContent.style.cssText='display:flex;flex-direction:column';
   $waitingArea.classList.remove('show');
+  $waitingLabel.textContent='Код вашей комнаты';
+  $waitingHintText.textContent='Отправьте этот код собеседнику — соединение установится автоматически';
   $emptyState.style.display='flex';
   $connectingOv.classList.remove('show');
   $chatHeader.classList.remove('show');
   $messages.classList.remove('show');
   $inputArea.classList.remove('show');
   $typingIndicator.classList.remove('show');
+  $incomingBanner.classList.remove('show');
   $app.classList.remove('in-chat');
 }
 function showWaiting(c){$codeDisplay.textContent=c;$lobbyContent.style.display='none';$waitingArea.classList.add('show')}
@@ -575,10 +595,10 @@ $('file-input').addEventListener('change',e=>{
 });
 $('img-preview-cancel').addEventListener('click',()=>{pendingImg=null;$imgPreview.classList.remove('show')});
 
-// ── WEBRTC ──
+// ── WEBRTC (text chat) ──
 function createPC(){
   const pc=new RTCPeerConnection(ICE_CONFIG);
-  pc.onicecandidate=({candidate})=>{if(candidate&&socket?.connected)socket.emit('signal',{to:peerId,data:candidate})};
+  pc.onicecandidate=({candidate})=>{if(candidate&&socket?.connected)socket.emit('signal',{to:peerId,data:{kind:'chat',body:candidate}})};
   pc.onconnectionstatechange=()=>{if(['failed','disconnected'].includes(pc.connectionState)){appendMsg('Соединение прервано.','system');$sendBtn.disabled=true}};
   return pc;
 }
@@ -595,44 +615,319 @@ function setupCh(ch){
       if(msg.t==='typing'){msg.v?$typingIndicator.classList.add('show'):$typingIndicator.classList.remove('show');return}
       if(msg.t==='react'){addReaction(msg.idx,msg.emoji,false);return}
       if(msg.t==='img'){appendMsg(msg.data,'them',true);return}
+      if(msg.t==='call-offer'){handleIncomingCallOffer(msg.sdp);return}
+      if(msg.t==='call-answer'){handleCallAnswer(msg.sdp);return}
+      if(msg.t==='call-ice'){handleCallIce(msg.candidate);return}
+      if(msg.t==='call-decline'){onCallDeclined();return}
+      if(msg.t==='call-hangup'){onRemoteHangup();return}
     }catch(e){}
     $typingIndicator.classList.remove('show');
     appendMsg(data,'them');
   };
-  ch.onclose=()=>{appendMsg('Собеседник отключился.','system');$sendBtn.disabled=true;$typingIndicator.classList.remove('show')};
+  ch.onclose=()=>{appendMsg('Собеседник отключился.','system');$sendBtn.disabled=true;$typingIndicator.classList.remove('show');cleanupCall()};
 }
-async function startCreator(){peerConnection=createPC();setupCh(peerConnection.createDataChannel('chat'));const o=await peerConnection.createOffer();await peerConnection.setLocalDescription(o);socket.emit('signal',{to:peerId,data:peerConnection.localDescription})}
+async function startCreator(){
+  peerConnection=createPC();setupCh(peerConnection.createDataChannel('chat'));
+  const o=await peerConnection.createOffer();await peerConnection.setLocalDescription(o);
+  socket.emit('signal',{to:peerId,data:{kind:'chat',body:peerConnection.localDescription}});
+}
 function startGuest(){peerConnection=createPC();peerConnection.ondatachannel=e=>setupCh(e.channel)}
 function closePeer(){peerConnection?.close();peerConnection=null;dataChannel=null;isTyping=false}
 
+// ── VOICE CALL ──
+async function getMicStream(){
+  try{ return await navigator.mediaDevices.getUserMedia({audio:true}); }
+  catch(e){ showAlert('Не удалось получить доступ к микрофону. Проверьте разрешения браузера.'); throw e; }
+}
+
+function createCallPC(onIce){
+  const pc=new RTCPeerConnection(ICE_CONFIG);
+  pc.onicecandidate=({candidate})=>{ if(candidate) onIce(candidate); };
+  pc.ontrack=(e)=>{ $remoteAudio.srcObject=e.streams[0]; };
+  pc.onconnectionstatechange=()=>{
+    if(pc.connectionState==='connected') onCallConnected();
+    if(['failed','disconnected','closed'].includes(pc.connectionState) && pc===callPC){
+      if(pc.connectionState!=='closed') appendCallEndedMessage();
+      cleanupCall();
+    }
+  };
+  return pc;
+}
+
+function appendCallEndedMessage(){
+  if(callMode==='inchat') appendMsg('Звонок завершён.','system');
+}
+
+async function flushPendingCallIce(){
+  while(pendingCallIce.length){
+    const c=pendingCallIce.shift();
+    try{ await callPC.addIceCandidate(new RTCIceCandidate(c)); }catch(e){}
+  }
+}
+
+function showCallOverlay(statusText,ringing){
+  $callStatusText.textContent=statusText;
+  $callTimerEl.style.display='none';
+  $callOverlay.classList.toggle('ringing',!!ringing);
+  $callOverlay.classList.add('show');
+}
+
+function onCallConnected(){
+  if(callStartTs)return; // already running
+  callStartTs=Date.now();
+  $callStatusText.textContent='Соединено';
+  $callOverlay.classList.remove('ringing');
+  $callTimerEl.style.display='inline';
+  clearInterval(callTimerInterval);
+  callTimerInterval=setInterval(updateCallTimer,1000);
+  updateCallTimer();
+}
+function updateCallTimer(){
+  const s=Math.floor((Date.now()-callStartTs)/1000);
+  const m=String(Math.floor(s/60)).padStart(2,'0');
+  const sec=String(s%60).padStart(2,'0');
+  $callTimerEl.textContent=`${m}:${sec}`;
+}
+
+function cleanupCall(){
+  clearInterval(callTimerInterval);callTimerInterval=null;callStartTs=null;
+  $callOverlay.classList.remove('show','ringing');
+  $callTimerEl.style.display='none';
+  $incomingBanner.classList.remove('show');
+  if(callPC){ callPC.close(); callPC=null; }
+  if(localCallStream){ localCallStream.getTracks().forEach(t=>t.stop()); localCallStream=null; }
+  pendingCallIce=[];pendingCallOffer=null;
+  if($remoteAudio.srcObject){ $remoteAudio.srcObject=null; }
+  callMuted=false;$callMuteBtn.classList.remove('active');
+  const wasStandalone=callMode&&callMode.startsWith('standalone');
+  callMode=null;
+  if(wasStandalone){ showLobby(); }
+}
+
+// -- in-chat call (signaling over the already-open dataChannel) --
+$headerCallBtn.addEventListener('click', async ()=>{
+  if(callPC) return;
+  if(!dataChannel||dataChannel.readyState!=='open'){ showAlert('Нет активного соединения для звонка.'); return; }
+  let stream;
+  try{ stream=await getMicStream(); }catch(e){ return; }
+  localCallStream=stream;
+  callMode='inchat';
+  callPC=createCallPC(c=>{ if(dataChannel?.readyState==='open') dataChannel.send(JSON.stringify({t:'call-ice',candidate:c})); });
+  localCallStream.getTracks().forEach(t=>callPC.addTrack(t,localCallStream));
+  showCallOverlay('Вызов...',true);
+  const offer=await callPC.createOffer();
+  await callPC.setLocalDescription(offer);
+  dataChannel.send(JSON.stringify({t:'call-offer',sdp:callPC.localDescription}));
+});
+
+function handleIncomingCallOffer(sdp){
+  if(callPC){
+    if(dataChannel?.readyState==='open') dataChannel.send(JSON.stringify({t:'call-decline'}));
+    return;
+  }
+  pendingCallOffer=sdp;
+  $incomingBanner.classList.add('show');
+}
+
+$incomingAcceptBtn.addEventListener('click', async ()=>{
+  $incomingBanner.classList.remove('show');
+  if(!pendingCallOffer) return;
+  const offer=pendingCallOffer;pendingCallOffer=null;
+  let stream;
+  try{ stream=await getMicStream(); }
+  catch(e){ if(dataChannel?.readyState==='open') dataChannel.send(JSON.stringify({t:'call-decline'})); return; }
+  localCallStream=stream;
+  callMode='inchat';
+  callPC=createCallPC(c=>{ if(dataChannel?.readyState==='open') dataChannel.send(JSON.stringify({t:'call-ice',candidate:c})); });
+  localCallStream.getTracks().forEach(t=>callPC.addTrack(t,localCallStream));
+  await callPC.setRemoteDescription(new RTCSessionDescription(offer));
+  await flushPendingCallIce();
+  const answer=await callPC.createAnswer();
+  await callPC.setLocalDescription(answer);
+  dataChannel.send(JSON.stringify({t:'call-answer',sdp:callPC.localDescription}));
+  showCallOverlay('Соединяем...',true);
+});
+
+$incomingDeclineBtn.addEventListener('click', ()=>{
+  $incomingBanner.classList.remove('show');
+  if(dataChannel?.readyState==='open') dataChannel.send(JSON.stringify({t:'call-decline'}));
+  pendingCallOffer=null;
+});
+
+async function handleCallAnswer(sdp){
+  if(!callPC) return;
+  await callPC.setRemoteDescription(new RTCSessionDescription(sdp));
+  await flushPendingCallIce();
+}
+async function handleCallIce(candidate){
+  if(callPC && callPC.remoteDescription && callPC.remoteDescription.type){
+    try{ await callPC.addIceCandidate(new RTCIceCandidate(candidate)); }catch(e){}
+  } else {
+    pendingCallIce.push(candidate);
+  }
+}
+function onCallDeclined(){ appendMsg('Звонок отклонён.','system'); cleanupCall(); }
+function onRemoteHangup(){ appendMsg('Звонок завершён.','system'); cleanupCall(); }
+
+// -- standalone call room (signaled through the socket, kind:'call') --
+function sendCallSignalSocket(body){ if(socket?.connected) socket.emit('signal',{to:peerId,data:{kind:'call',body}}); }
+
+async function startStandaloneCallOffer(){
+  callMode='standalone-caller';
+  callPC=createCallPC(c=>sendCallSignalSocket(c));
+  localCallStream.getTracks().forEach(t=>callPC.addTrack(t,localCallStream));
+  showCallOverlay('Вызов...',true);
+  const offer=await callPC.createOffer();
+  await callPC.setLocalDescription(offer);
+  sendCallSignalSocket(callPC.localDescription);
+}
+
+async function handleStandaloneCallSignal(body){
+  if(body.hangup){ appendAlertCallEnded(); cleanupCall(); return; }
+  if(body.type==='offer'){
+    if(!callPC){
+      if(!localCallStream){
+        try{ localCallStream=await getMicStream(); }
+        catch(e){ sendCallSignalSocket({hangup:true}); cleanupCall(); return; }
+      }
+      callMode='standalone-guest';
+      callPC=createCallPC(c=>sendCallSignalSocket(c));
+      localCallStream.getTracks().forEach(t=>callPC.addTrack(t,localCallStream));
+      showCallOverlay('Соединяем...',true);
+    }
+    await callPC.setRemoteDescription(new RTCSessionDescription(body));
+    await flushPendingCallIce();
+    const answer=await callPC.createAnswer();
+    await callPC.setLocalDescription(answer);
+    sendCallSignalSocket(callPC.localDescription);
+  } else if(body.type==='answer'){
+    if(callPC){ await callPC.setRemoteDescription(new RTCSessionDescription(body)); await flushPendingCallIce(); }
+  } else if(body.candidate){
+    await handleCallIceStandalone(body);
+  }
+}
+async function handleCallIceStandalone(candidate){
+  if(callPC && callPC.remoteDescription && callPC.remoteDescription.type){
+    try{ await callPC.addIceCandidate(new RTCIceCandidate(candidate)); }catch(e){}
+  } else {
+    pendingCallIce.push(candidate);
+  }
+}
+function appendAlertCallEnded(){ showAlert('Собеседник завершил звонок.'); }
+
+// shared call controls
+$callMuteBtn.addEventListener('click', ()=>{
+  if(!localCallStream) return;
+  callMuted=!callMuted;
+  localCallStream.getAudioTracks().forEach(t=>t.enabled=!callMuted);
+  $callMuteBtn.classList.toggle('active',callMuted);
+});
+$callHangupBtn.addEventListener('click', ()=>{
+  if(callMode==='inchat'){
+    if(dataChannel?.readyState==='open') dataChannel.send(JSON.stringify({t:'call-hangup'}));
+    appendMsg('Вы завершили звонок.','system');
+  } else if(callMode && callMode.startsWith('standalone')){
+    sendCallSignalSocket({hangup:true});
+  }
+  cleanupCall();
+});
+
 // ── SOCKET ──
+function ensureSocketConnected(){ if(!socket||!socket.connected) initSocket(); }
+
 function initSocket(){
   socket=io(SERVER_URL,{transports:['websocket']});
-  socket.on('connect',()=>{setStatus('ok','Подключено');$('btn-create').disabled=false;$('btn-join').disabled=false});
-  socket.on('disconnect',()=>{if(dataChannel?.readyState==='open')return;setStatus('err','Сервер недоступен');$('btn-create').disabled=true;$('btn-join').disabled=true});
-  socket.on('connect_error',()=>setStatus('','Сервер просыпается...'));
-  socket.on('room-created',({code})=>showWaiting(code));
-  socket.on('user-joined',({guestId})=>{peerId=guestId;showConnecting('Соединяем...');startCreator()});
-  socket.on('signal',async({from,data})=>{
-    if(!peerConnection)return;peerId=from;
-    if(data.type==='offer'){await peerConnection.setRemoteDescription(new RTCSessionDescription(data));const a=await peerConnection.createAnswer();await peerConnection.setLocalDescription(a);socket.emit('signal',{to:peerId,data:peerConnection.localDescription})}
-    else if(data.type==='answer')await peerConnection.setRemoteDescription(new RTCSessionDescription(data));
-    else if(data.candidate)try{await peerConnection.addIceCandidate(new RTCIceCandidate(data))}catch{}
+  socket.on('connect',()=>{
+    setStatus('ok','Подключено');
+    $('btn-create').disabled=false;$('btn-join').disabled=false;
+    $btnCreateCall.disabled=false;$btnJoinCall.disabled=false;
   });
-  socket.on('error-message',({message})=>{showAlert(message);showLobby()});
-  socket.on('peer-disconnected',()=>{appendMsg('Собеседник отключился.','system');$sendBtn.disabled=true;closePeer()});
+  socket.on('disconnect',()=>{
+    if(dataChannel?.readyState==='open')return;
+    setStatus('err','Сервер недоступен');
+    $('btn-create').disabled=true;$('btn-join').disabled=true;
+    $btnCreateCall.disabled=true;$btnJoinCall.disabled=true;
+  });
+  socket.on('connect_error',()=>setStatus('','Сервер просыпается...'));
+  socket.on('room-created',({code,type})=>{
+    if(type==='call'){
+      $waitingLabel.textContent='Код звонка';
+      $waitingHintText.textContent='Отправьте этот код собеседнику для голосового звонка — соединение установится автоматически';
+    } else {
+      $waitingLabel.textContent='Код вашей комнаты';
+      $waitingHintText.textContent='Отправьте этот код собеседнику — соединение установится автоматически';
+    }
+    showWaiting(code);
+  });
+  socket.on('user-joined', async ({guestId,type})=>{
+    peerId=guestId;
+    if(type==='call'){
+      showConnecting('Соединяем звонок...');
+      try{ localCallStream=await getMicStream(); }
+      catch(e){ showLobby(); return; }
+      await startStandaloneCallOffer();
+    } else {
+      showConnecting('Соединяем...');
+      startCreator();
+    }
+  });
+  socket.on('signal', async ({from,data})=>{
+    if(data && data.kind==='call'){
+      peerId=from;
+      await handleStandaloneCallSignal(data.body);
+      return;
+    }
+    if(!peerConnection)return;
+    peerId=from;
+    const body=(data && data.kind==='chat')?data.body:data;
+    if(body.type==='offer'){
+      await peerConnection.setRemoteDescription(new RTCSessionDescription(body));
+      const a=await peerConnection.createAnswer();
+      await peerConnection.setLocalDescription(a);
+      socket.emit('signal',{to:peerId,data:{kind:'chat',body:peerConnection.localDescription}});
+    }
+    else if(body.type==='answer')await peerConnection.setRemoteDescription(new RTCSessionDescription(body));
+    else if(body.candidate)try{await peerConnection.addIceCandidate(new RTCIceCandidate(body))}catch{}
+  });
+  socket.on('error-message',({message})=>{
+    showAlert(message);
+    if(localCallStream && !callPC){ localCallStream.getTracks().forEach(t=>t.stop()); localCallStream=null; }
+    showLobby();
+  });
+  socket.on('peer-disconnected',()=>{
+    if(callMode && callMode.startsWith('standalone')){
+      cleanupCall();
+      showAlert('Собеседник покинул звонок.');
+      showLobby();
+      return;
+    }
+    appendMsg('Собеседник отключился.','system');$sendBtn.disabled=true;closePeer();cleanupCall();
+  });
 }
 
 // ── UI ──
-$('btn-create').addEventListener('click',()=>{hideAlert();socket.emit('create-room')});
+$('btn-create').addEventListener('click',()=>{hideAlert();ensureSocketConnected();socket.emit('create-room',{type:'chat'})});
 $('btn-join').addEventListener('click',()=>{
   hideAlert();
   const code=$('join-input').value.trim();
   if(!/^\d{4}$/.test(code)){showAlert('Введите 4-значный код.');return}
-  showConnecting('Ищем комнату...');startGuest();socket.emit('join-room',{code});
+  ensureSocketConnected();
+  showConnecting('Ищем комнату...');startGuest();socket.emit('join-room',{code,type:'chat'});
 });
 $('join-input').addEventListener('keydown',e=>{if(e.key==='Enter')$('btn-join').click()});
-$('btn-cancel').addEventListener('click',()=>{closePeer();showLobby()});
+
+$btnCreateCall.addEventListener('click',()=>{hideAlert();ensureSocketConnected();socket.emit('create-room',{type:'call'})});
+$btnJoinCall.addEventListener('click',()=>{
+  hideAlert();
+  const code=$joinCallInput.value.trim();
+  if(!/^\d{4}$/.test(code)){showAlert('Введите 4-значный код.');return}
+  ensureSocketConnected();
+  showConnecting('Ищем звонок...');
+  socket.emit('join-room',{code,type:'call'});
+});
+$joinCallInput.addEventListener('keydown',e=>{if(e.key==='Enter')$btnJoinCall.click()});
+
+$('btn-cancel').addEventListener('click',()=>{closePeer();cleanupCall();showLobby()});
 $('back-btn').addEventListener('click',()=>$app.classList.remove('in-chat'));
 
 $('emoji-btn').addEventListener('click',e=>{e.stopPropagation();$emojiPanel.classList.toggle('show')});
@@ -665,7 +960,14 @@ function send(){
   if(dataChannel?.readyState==='open')dataChannel.send(JSON.stringify({t:'typing',v:false}));
 }
 
-window.addEventListener('beforeunload',()=>{closePeer();socket?.disconnect()});
+window.addEventListener('beforeunload',()=>{
+  try{ if(callMode==='inchat' && dataChannel?.readyState==='open') dataChannel.send(JSON.stringify({t:'call-hangup'})); }catch(e){}
+  try{ if(callMode && callMode.startsWith('standalone')) sendCallSignalSocket({hangup:true}); }catch(e){}
+  closePeer();
+  try{ if(callPC) callPC.close(); }catch(e){}
+  try{ localCallStream?.getTracks().forEach(t=>t.stop()); }catch(e){}
+  socket?.disconnect();
+});
 showLobby();initSocket();
 </script>
 </body>
