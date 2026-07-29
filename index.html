@@ -666,6 +666,7 @@ async function flushPendingCallIce(){
 }
 
 function showCallOverlay(statusText,ringing){
+  $app.classList.add('in-chat');
   $callStatusText.textContent=statusText;
   $callTimerEl.style.display='none';
   $callOverlay.classList.toggle('ringing',!!ringing);
